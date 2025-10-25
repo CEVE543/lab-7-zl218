@@ -1,7 +1,7 @@
 ---
 title: "CEVE 543 Fall 2025 Lab 7: Bias Correction Implementation"
 subtitle: "Delta method and quantile mapping for temperature bias correction"
-author: CEVE 543 Fall 2025
+author: Zijie (Ian) Liang
 date: "2025-10-24"
 type: "lab"
 module: 2
@@ -32,6 +32,16 @@ format:
       y: 1in
     number-sections: true
     fig-format: svg
+  pdf:
+    pdf-engine: lualatex
+    documentclass: article
+    classoption: []        
+    callout-icon: false    
+    default-image-extension: png
+    link-external-icon: false
+    fig-format: png
+    dpi: 300
+
 
 execute:
   cache: true
@@ -42,7 +52,7 @@ code-overflow: wrap
 code-line-numbers: false
 code-block-font-size: "0.85em"
 
-bibliography: ../../references.bib
+bibliography: references.bib
 ---
 
 ## Background and Goals
@@ -277,7 +287,144 @@ Follow these steps:
 :::
 
 ```{julia}
-# Your code here
+# Step 1 - Calculate the mean difference: Δ_m = mean(GCM_hist) - mean(Obs_hist)
+gcm_monthly = @chain df_gcm_hist begin
+    @group_by(month)
+    @summarize(gcm_mean = mean(temp))
+    @arrange(month)
+end
+
+obs_monthly = @chain df_obs_hist begin
+    @group_by(month)
+    @summarize(obs_mean = mean(TAVG))
+    @arrange(month)
+end
+
+monthly_bias = leftjoin(gcm_monthly, obs_monthly, on = :month)
+monthly_bias.bias = monthly_bias.gcm_mean .- monthly_bias.obs_mean
+monthly_bias = sort(monthly_bias, :month)
+
+@assert all(sort(unique(monthly_bias.month)) .== collect(1:12)) "Monthly bias missing some months"
+
+# Print the GEM and Obs data as dataframe
+for row in eachrow(monthly_bias)
+    println("Month: $(row.month), GCM mean = $(round(row.gcm_mean, digits=2)), ",
+            "Obs mean = $(round(row.obs_mean, digits=2)), ",
+            "Bias (GCM - Obs) = $(round(row.bias, digits=2))")
+end
+
+
+```
+
+The GCM model underestimate so the bias is negative. Need to adjust the model.
+
+```{julia}
+# Step 2 - Barplot for monthly bias（GCM - Obs，1995–2014）
+fig = Figure()
+ax  = Axis(fig[1, 1];
+    title = "Monthly Mean Bias (GCM − Obs), 1995–2014",
+    xlabel = "Month",
+    ylabel = L"Temperature Bias ($^\circ$C)",
+    xticks = MONTH_LABELS
+)
+
+barplot!(ax, monthly_bias.month, monthly_bias.bias, strokewidth = 0)
+hlines!(ax, 0; color = :black, linestyle = :dash, linewidth = 1)
+
+fig
+```
+
+```{julia}
+# Stpe 3 - Apply the delta-method bias correction: T_corr = T_gcm - Δ_m.
+
+
+# gcm_temps::AbstractVector: Future-period GCM temperatures
+# gcm_dates::AbstractVector{<:Date}: Dates corresponding to each temperature
+# monthly_bias_df::DataFrame: Must contain columns `month` and `bias`
+
+function apply_delta_method(gcm_temps, gcm_dates, monthly_bias_df)
+    corrected_temps = similar(gcm_temps)  # preserve element type & length
+
+    # Create a dictionary for fast month-to-bias lookup
+    bias_map = Dict(monthly_bias_df.month[i] => monthly_bias_df.bias[i] 
+                    for i in 1:nrow(monthly_bias_df))
+
+    # Apply correction
+    for i in eachindex(gcm_temps)
+        m = month(gcm_dates[i])
+        Δm = bias_map[m]  # lookup bias for that month
+        corrected_temps[i] = gcm_temps[i] - Δm
+    end
+
+    return corrected_temps
+end
+
+```
+
+```{julia}
+# Step 4 - Apply the correction
+
+df_ssp370_near.temp_delta = apply_delta_method(
+    df_ssp370_near.temp,
+    df_ssp370_near.date,
+    monthly_bias
+)
+first(df_ssp370_near, 5)
+
+```
+
+```{julia}
+# Step 5 - Compute monthly climatologies
+near_monthly_raw = @chain df_ssp370_near begin
+    @group_by(month)
+    @summarize(mean_temp = mean(temp))
+    @arrange(month)
+end
+
+near_monthly_delta = @chain df_ssp370_near begin
+    @group_by(month)
+    @summarize(mean_temp = mean(temp_delta))
+    @arrange(month)
+end
+
+@assert all(near_monthly_raw.month .== collect(1:12))
+@assert all(near_monthly_delta.month .== collect(1:12))
+
+println(names(near_monthly_raw))
+println(near_monthly_raw)
+
+println(names(near_monthly_delta))
+println(near_monthly_delta)
+
+```
+
+```{julia}
+# Step 6 - Creat comparison plot
+rename!(obs_monthly, :obs_mean => :mean_temp)
+
+fig = Figure()
+ax  = Axis(fig[1, 1];
+    title  = "Delta Method: Annual Cycle for SSP3-7.0 Near-Term (2020–2040)",
+    xlabel = "Month",
+    ylabel = L"Temperature ($^\circ$C)",
+    xticks = MONTH_LABELS
+)
+
+# Historical Obs
+lines!(ax, obs_monthly.month, obs_monthly.mean_temp;
+    linewidth = 2, color = :steelblue, label = "Historical Obs")
+
+# Near monthly raw
+lines!(ax, near_monthly_raw.month, near_monthly_raw.mean_temp;
+    linewidth = 2, color = :coral, label = "GCM Raw")
+
+# Near monthly delta
+lines!(ax, near_monthly_delta.month, near_monthly_delta.mean_temp;
+    linewidth = 2, color = :green, linestyle = :dash, label = "Delta Corrected")
+
+axislegend(ax, position = :lt)
+fig
+
 ```
 
 ### Task 3: Implement Quantile-Quantile Mapping
@@ -311,7 +458,105 @@ Follow these steps:
 :::
 
 ```{julia}
-# Your code here
+# Step 1 - Extract temperature vectors as Float64 (historical period)
+
+# Obs (1995 - 2014)：df_obs_hist.TAVG -> Float64
+obs_hist_temps = Float64.(collect(skipmissing(df_obs_hist.TAVG))) # skip missing
+
+# GCM（历史期 1995–2014）：df_gcm_hist.temp -> Float64 
+gcm_hist_temps = Float64.(collect(skipmissing(df_gcm_hist.temp))) # skip missing
+
+
+obs_hist_temps = filter(isfinite, obs_hist_temps)
+gcm_hist_temps = filter(isfinite, gcm_hist_temps)
+
+
+@assert length(obs_hist_temps) > 0 "obs_hist_temps is empty"
+@assert length(gcm_hist_temps) > 0 "gcm_hist_temps is empty"
+println("Obs hist n=", length(obs_hist_temps), " | GCM hist n=", length(gcm_hist_temps))
+
+```
+
+```{julia}
+# Step 2 - Fit empirical CDFs
+
+ecdf_obs = ecdf(obs_hist_temps)
+ecdf_gcm = ecdf(gcm_hist_temps)
+
+println("ECDF check — obs at 0°C:   ", ecdf_obs(0.0))
+println("ECDF check — gcm at 0°C:   ", ecdf_gcm(0.0))
+
+```
+
+```{julia}
+# Step 3 - Write the mapping function
+
+"""
+Apply empirical Quantile-Quantile (QQ) mapping correction.
+
+Arguments:
+- gcm_temps::Vector{Float64}: Future-period GCM temperature data to correct
+- ecdf_gcm: Empirical CDF function of historical GCM temps (from StatsBase.ecdf)
+- obs_hist_temps::Vector{Float64}: Historical observed temps for quantile mapping
+
+Returns:
+- corrected_temps::Vector{Float64}: QQ-mapped corrected temperatures
+"""
+function apply_qqmap_empirical(gcm_temps, ecdf_gcm, obs_hist_temps)
+    corrected_temps = similar(gcm_temps)  # same type and size as input
+
+    for i in eachindex(gcm_temps)
+        # Step 1: Get percentile from historical GCM distribution
+        p = ecdf_gcm(gcm_temps[i])
+
+        # Step 2: Clamp percentile to avoid extreme tail errors
+        p_clamped = clamp(p, 0.001, 0.999)
+
+        # Step 3: Map percentile into observed historical distribution
+        corrected_temps[i] = quantile(obs_hist_temps, p_clamped)
+    end
+
+    return corrected_temps
+end
+
+
+```
+
+```{julia}
+# Step 4 - Apply the correction
+
+df_ssp370_near.temp_qqmap = apply_qqmap_empirical(
+    Float64.(df_ssp370_near.temp),  # Future GCM temperatures
+    ecdf_gcm,                       # Historical GCM ECDF
+    obs_hist_temps                 # Historical OBS distribution
+)
+first(df_ssp370_near, 5)
+
+```
+
+```{julia}
+# Step 5 - Creat the QQ plot
+
+percentiles = collect(0.01:0.01:0.99) # Define precentiles
+
+# Compute two quantiles
+obs_quantiles      = [quantile(obs_hist_temps,  p) for p in percentiles]
+gcm_hist_quantiles = [quantile(gcm_hist_temps, p) for p in percentiles]
+
+# Scatter plot 
+fig = Figure()
+ax  = Axis(fig[1, 1];
+    title  = "QQ Plot: GCM Historical vs Observations (1995–2014)",
+    xlabel = L"Observed Quantiles ($^\circ$C)",
+    ylabel = L"GCM Quantiles ($^\circ$C)",
+    aspect = DataAspect() # plot square
+)
+
+scatter!(ax, obs_quantiles, gcm_hist_quantiles; markersize=6)
+lines!(ax, [-20, 40], [-20, 40]; linestyle=:dash, color=:black)  # 1:1 reference line
+
+fig
+
 ```
 
 ### Task 4: Compare Methods
@@ -337,8 +582,60 @@ After creating the plot, examine it carefully and consider:
 :::
 
 ```{julia}
-# Your code here
+# Step 1 - Monthy mean for QQ-mapped temepratures
+
+near_monthly_qqmap = @chain df_ssp370_near begin
+    @group_by(month)
+    @summarize(mean_temp = mean(temp_qqmap))
+    @arrange(month)
+end
 ```
+
+```{julia}
+# Step 2 - Create the formatted comparison figure
+
+fig = Figure()
+ax = Axis(
+    fig[1, 1];
+    title = "Annual Cycle Comparison: All Methods (Near-term 2020–2040)",
+    xlabel = "Month",
+    ylabel = L"Temperature ($^\circ$C)",
+    xticks = MONTH_LABELS
+)
+
+# Historical Observations (black, solid, width = 2.5)
+lines!(ax,
+    obs_monthly.month, obs_monthly.mean_temp;
+    color = :black, linewidth = 2.5, linestyle = :solid, label = "Historical Obs"
+)
+
+# Raw GCM near-term (coral/red, solid)
+lines!(ax,
+    near_monthly_raw.month, near_monthly_raw.mean_temp;
+    color = :coral, linewidth = 2, linestyle = :solid, label = "Raw GCM"
+)
+
+# Delta corrected (green, dashed)
+lines!(ax,
+    near_monthly_delta.month, near_monthly_delta.mean_temp;
+    color = :green, linewidth = 2, linestyle = :dash, label = "Delta"
+)
+
+# QQ-mapped (purple, dotted)
+lines!(ax,
+    near_monthly_qqmap.month, near_monthly_qqmap.mean_temp;
+    color = :purple, linewidth = 2, linestyle = :dot, label = "QQ-map"
+)
+
+axislegend(ax, position = :lt)
+fig
+
+
+```
+
+The delta method applies a fixed mean adjustment to each month which results in a uniform shift of the future temperature cycle while preserving the model projected warming pattern. In contrast, the QQ mapping method remaps each future value according to its empirical percentile, which causes a redistribution of the full temperature distribution. The redistribution reduces the magnitude of projected warming because it constrains future values to align more closely with the historical observed distribution. The elevated summer peak in the QQ mapped line indicates that this approach moderates extremes instead of allowing the stronger warming predicted by the raw model.
+
+The QQ mapped curve lies closer to the historical observations in several months, like spring time when the tempwerature is soft, which implies stronger adherence to the reference climatology. The tighter alignment can improve representation of present day conditions but it may artificially weaken future warming signals. Such dampening of the climate change signal can underestimate projected risks in impact assessments and may lead to insufficient adaptation or resilience planning when future extremes are critical to decision making.
 
 ### Task 5: Reflection
 
@@ -356,13 +653,33 @@ Write brief responses (2-3 sentences each) to the following questions:
 
 #### Method Selection for Urban Heat Management
 
-*Your response here*
+*For urban heat management, I would recommend QQ-mapping because it corrects the full distribution of temperatures rather than only adjusting monthly means. The QQ-plot demonstrates that QQ-mapping better aligns the model with the observed distribution across all percentiles. The method could provides a more reliable basis for evaluating thresholds relevant to public health and urban cooling strategies.*
 
 #### Appropriateness of QQ-Mapping for Temperature
 
-*Your response here*
+*In the study by Ines and Hansen (2006), QQ-mapping was essential for rainfall because impact models such as crop simulations are sensitive to both event frequency and intensity, especially under highly skewed precipitation distributions. For temperature, the distribution is typically smoother and less intermittent. Full distribution mapping may sometimes overconstrain future projections and dampen climate change signals that policymakers must consider. In cases where preserving the magnitude of projected warming is a priority, the delta method may be more appropriate because it maintains the climate model’s change signal while still correcting systematic mean bias. *
 
 ## References
 
 ::: {#refs}
+```{julia}
+
+open("references.bib", "w") do f
+    write(f, """
+@article{_biascorrection:2006,
+  author  = {Ines, A. V. M. and Hansen, J. W.},
+  title   = {Bias Correction of Daily GCM Rainfall for Crop Simulation Studies},
+  journal = {Agricultural and Forest Meteorology},
+  year    = {2006},
+  volume  = {138},
+  number  = {1},
+  pages   = {44--53},
+  doi     = {10.1016/j.agrformet.2006.03.009}
+}
+""")
+end
+
+println("Bib file exist")
+
+```
 :::
